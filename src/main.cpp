@@ -22,7 +22,27 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 #endif // _WIN32
+#include <codecvt>
+#include <memory>
+#include <thread>
+
 #include "webp_image.h"
+#include "FFmpegVideoDecoder.h"
+#include "FFmpegVideoEncoder.h"
+
+
+std::string wstr2str(std::wstring string_to_convert)
+{
+
+    //setup converter
+    using convert_type = std::codecvt_utf8<wchar_t>;
+    std::wstring_convert<convert_type, wchar_t> converter;
+
+    //use converter (.to_bytes: wstr->str, .from_bytes: str->wstr)
+    std::string converted_str = converter.to_bytes( string_to_convert );
+    return converted_str;
+}
+
 
 #if _WIN32
 #include <wchar.h>
@@ -228,53 +248,61 @@ static int encode_image(const path_t& imagepath, const ncnn::Mat& image)
     return success ? 0 : -1;
 }
 
+
 class Task
 {
 public:
     int id;
-    int webp0;
-    int webp1;
 
-    path_t in0path;
-    path_t in1path;
-    path_t outpath;
-    float timestep;
+    int step = 1;
+
+    double time0;
+    double time1;
+
+    bool processed = false;
 
     ncnn::Mat in0image;
     ncnn::Mat in1image;
-    ncnn::Mat outimage;
+    ncnn::Mat out0image;
+    ncnn::Mat out1image;
+    ncnn::Mat out2image;
+
 };
 
+template <typename T>
 class TaskQueue
 {
 public:
-    TaskQueue()
+    const int cap;
+    
+    TaskQueue(const int cap): cap(cap)
     {
     }
-
-    void put(const Task& v)
+    
+    void put(const T& v)
     {
         lock.lock();
 
-        while (tasks.size() >= 8) // FIXME hardcode queue length
-        {
-            condition.wait(lock);
-        }
+        while (tasks.size() >= cap) // FIXME hardcode queue length
+            {
+            condition_not_full.waitTime(lock, 3000);
+            }
 
+        
         tasks.push(v);
 
         lock.unlock();
 
-        condition.signal();
+        condition_has_data.broadcast();
     }
 
-    void get(Task& v)
+    void pop(T& v)
     {
         lock.lock();
 
         while (tasks.size() == 0)
         {
-            condition.wait(lock);
+            condition_has_data.waitTime(lock, 3000);
         }
 
         v = tasks.front();
@@ -282,56 +310,94 @@ public:
 
         lock.unlock();
 
-        condition.signal();
+        condition_not_full.broadcast();
     }
+
+    int pop_no_block(T& v)
+    {
+        int ret = 0;
+        lock.lock();
+
+        if (tasks.size() == 0)
+        {
+            ret = -1;
+        }
+        else
+        {
+            v = tasks.front();
+            tasks.pop();
+            ret = 1;
+        }
+
+
+        lock.unlock();
+        
+        return ret;
+    }
+
 
 private:
     ncnn::Mutex lock;
-    ncnn::ConditionVariable condition;
-    std::queue<Task> tasks;
+    ncnn::ConditionVariable condition_has_data;
+    ncnn::ConditionVariable condition_not_full;
+    std::queue<T> tasks;
 };
 
-TaskQueue toproc;
-TaskQueue tosave;
+TaskQueue<std::shared_ptr<Task>> toproc(8);
+TaskQueue<std::shared_ptr<Task>> tosave(40);
+TaskQueue<FMediaFrame> audioqueue(INT32_MAX);
+FFmpegVideoDecoder *VideoDecoder;
+
 
 class LoadThreadParams
 {
 public:
     int jobs_load;
-
-    // session data
-    std::vector<path_t> input0_files;
-    std::vector<path_t> input1_files;
-    std::vector<path_t> output_files;
-    std::vector<float> timesteps;
+    int step;
 };
 
 void* load(void* args)
 {
     const LoadThreadParams* ltp = (const LoadThreadParams*)args;
-    const int count = ltp->output_files.size();
 
-    #pragma omp parallel for schedule(static,1) num_threads(ltp->jobs_load)
-    for (int i=0; i<count; i++)
+    FMediaFrame FirstFrame;
+    VideoDecoder->DecodeMedia(FirstFrame);
+    FMediaFrame NewFrame;
+    int index = 0;
+    while (VideoDecoder->DecodeMedia(NewFrame) == 0)
     {
-        const path_t& image0path = ltp->input0_files[i];
-        const path_t& image1path = ltp->input1_files[i];
-
-        Task v;
-        v.id = i;
-        v.in0path = image0path;
-        v.in1path = image1path;
-        v.outpath = ltp->output_files[i];
-        v.timestep = ltp->timesteps[i];
-
-        int ret0 = decode_image(image0path, v.in0image, &v.webp0);
-        int ret1 = decode_image(image1path, v.in1image, &v.webp1);
-
-        if (ret0 != 0 || ret1 != 1)
+        if (NewFrame.Type == FFrameType::Video)
         {
-            v.outimage = ncnn::Mat(v.in0image.w, v.in0image.h, (size_t)3, 3);
-            toproc.put(v);
+            unsigned char* pixeldata0 = FirstFrame.Buffer;
+            unsigned char* pixeldata1 = NewFrame.Buffer;
+            if (pixeldata0 != nullptr && pixeldata1 != nullptr)
+            {
+                auto v = std::make_shared<Task>();
+                v->id = index++;
+                v->time0 = FirstFrame.Time;
+                v->time1 = NewFrame.Time;
+                v->step = ltp->step;
+
+                fprintf(stderr, "decode video time: %f\n", v->time1);
+
+                v->in0image = ncnn::Mat(FirstFrame.Width, FirstFrame.Height, pixeldata0, (size_t)3, 3);
+                v->in1image = ncnn::Mat(NewFrame.Width, NewFrame.Height, pixeldata1, (size_t)3, 3);
+                v->out0image = ncnn::Mat(NewFrame.Width, NewFrame.Height, (size_t)3, 3);
+                v->out1image = ncnn::Mat(NewFrame.Width, NewFrame.Height, (size_t)3, 3);
+                v->out2image = ncnn::Mat(NewFrame.Width, NewFrame.Height, (size_t)3, 3);
+                v->processed = false;
+                
+                toproc.put(v);
+                tosave.put(v);
+
+            }
+            FirstFrame = NewFrame;
         }
+        else if (NewFrame.Type == FFrameType::Audio)
+        {
+            audioqueue.put(NewFrame);
+        }
+
     }
 
     return 0;
@@ -350,16 +416,28 @@ void* proc(void* args)
 
     for (;;)
     {
-        Task v;
+        std::shared_ptr<Task> v;
 
-        toproc.get(v);
+        toproc.pop(v);
 
-        if (v.id == -233)
+        if (v->id == -233)
             break;
 
-        rife->process(v.in0image, v.in1image, v.timestep, v.outimage);
+        const int step = v->step;
+        if (step >= 1)
+        {
+            rife->process(v->in0image, v->in1image, 1.0f/(1.0f+step), v->out0image);
+        }
+        if (step >= 2)
+        {
+            rife->process(v->in0image, v->in1image, 1.0f/(1.0f+step) * 2, v->out1image);
+        }
+        if (step >= 3)
+        {
+            rife->process(v->in0image, v->in1image, 1.0f/(1.0f+step) * 3, v->out2image);
+        }
 
-        tosave.put(v);
+        v->processed = true;
     }
 
     return 0;
@@ -369,68 +447,76 @@ class SaveThreadParams
 {
 public:
     int verbose;
+    int width;
+    int height;
+    std::string save_path;
 };
 
 void* save(void* args)
 {
     const SaveThreadParams* stp = (const SaveThreadParams*)args;
-    const int verbose = stp->verbose;
-
+    FFmpegVideoEncoder encoder(stp->width, stp->height, stp->save_path);
+    bool first_encoded = false;
+    
     for (;;)
     {
-        Task v;
+        std::shared_ptr<Task> v;
 
-        tosave.get(v);
+        tosave.pop(v);
 
-        if (v.id == -233)
+        if (v->id == -233)
             break;
 
-        int ret = encode_image(v.outpath, v.outimage);
-
-        // free input pixel data
+        while (!v->processed)
         {
-            unsigned char* pixeldata = (unsigned char*)v.in0image.data;
-            if (v.webp0 == 1)
+            encoder.Flush();
+            if (!v->processed)
             {
-                free(pixeldata);
-            }
-            else
-            {
-#if _WIN32
-                free(pixeldata);
-#else
-                stbi_image_free(pixeldata);
-#endif
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
         }
+        
+        FMediaFrame audio_frame;
+        while (audioqueue.pop_no_block(audio_frame) > 0)
         {
-            unsigned char* pixeldata = (unsigned char*)v.in1image.data;
-            if (v.webp1 == 1)
-            {
-                free(pixeldata);
-            }
-            else
-            {
-#if _WIN32
-                free(pixeldata);
-#else
-                stbi_image_free(pixeldata);
-#endif
-            }
+            encoder.AddAudioBuffer(audio_frame.Buffer, audio_frame.Size);
+            ResetMediaFrame(audio_frame);
         }
 
-        if (ret == 0)
+        if (!first_encoded)
         {
-            if (verbose)
-            {
-#if _WIN32
-                fwprintf(stderr, L"%ls %ls %f -> %ls done\n", v.in0path.c_str(), v.in1path.c_str(), v.timestep, v.outpath.c_str());
-#else
-                fprintf(stderr, "%s %s %f -> %s done\n", v.in0path.c_str(), v.in1path.c_str(), v.timestep, v.outpath.c_str());
-#endif
-            }
+            encoder.AddVideoBuffer((const char*)v->in0image.data, v->in0image.w, v->in0image.h, v->time0);
+            first_encoded = true;
+        }
+
+        const int step = v->step;
+        const float start_time = v->time0;
+        const float step_time = (v->time1 - v->time0)/(step+1);
+
+        if (step >= 1)
+        {
+            encoder.AddVideoBuffer((const char*)v->out0image.data, v->out0image.w, v->out0image.h, start_time+step_time);
+        }
+        if (step >= 2)
+        {
+            encoder.AddVideoBuffer((const char*)v->out0image.data, v->out0image.w, v->out0image.h, start_time+step_time*2);
+        }
+        if (step >= 3)
+        {
+            encoder.AddVideoBuffer((const char*)v->out0image.data, v->out0image.w, v->out0image.h, start_time+step_time*3);
+        }
+
+        
+        encoder.AddVideoBuffer((const char*)v->in1image.data, v->in1image.w, v->in1image.h, v->time1);
+        v->out0image.release();
+        void *buffer = v->in0image.data;
+        v->in0image.release();
+        if (buffer != nullptr)
+        {
+            //free(buffer);
         }
     }
+    encoder.EndEncoder();
 
     return 0;
 }
@@ -442,8 +528,7 @@ int wmain(int argc, wchar_t** argv)
 int main(int argc, char** argv)
 #endif
 {
-    path_t input0path;
-    path_t input1path;
+    auto begin_time = std::chrono::system_clock::now();
     path_t inputpath;
     path_t outputpath;
     int numframe = 0;
@@ -452,7 +537,7 @@ int main(int argc, char** argv)
     std::vector<int> gpuid;
     int jobs_load = 1;
     std::vector<int> jobs_proc;
-    int jobs_save = 2;
+    int jobs_save = 1;
     int verbose = 0;
     int tta_mode = 0;
     int tta_temporal_mode = 0;
@@ -462,16 +547,10 @@ int main(int argc, char** argv)
 #if _WIN32
     setlocale(LC_ALL, "");
     wchar_t opt;
-    while ((opt = getopt(argc, argv, L"0:1:i:o:n:s:m:g:j:f:vxzuh")) != (wchar_t)-1)
+    while ((opt = getopt(argc, argv, L"i:o:n:s:m:g:j:f:vxzuh")) != (wchar_t)-1)
     {
         switch (opt)
         {
-        case L'0':
-            input0path = optarg;
-            break;
-        case L'1':
-            input1path = optarg;
-            break;
         case L'i':
             inputpath = optarg;
             break;
@@ -517,16 +596,10 @@ int main(int argc, char** argv)
     }
 #else // _WIN32
     int opt;
-    while ((opt = getopt(argc, argv, "0:1:i:o:n:s:m:g:j:f:vxzuh")) != -1)
+    while ((opt = getopt(argc, argv, "i:o:n:s:m:g:j:f:vxzuh")) != -1)
     {
         switch (opt)
         {
-        case '0':
-            input0path = optarg;
-            break;
-        case '1':
-            input1path = optarg;
-            break;
         case 'i':
             inputpath = optarg;
             break;
@@ -572,7 +645,7 @@ int main(int argc, char** argv)
     }
 #endif // _WIN32
 
-    if (((input0path.empty() || input1path.empty()) && inputpath.empty()) || outputpath.empty())
+    if (inputpath.empty() || outputpath.empty())
     {
         print_usage();
         return -1;
@@ -610,51 +683,7 @@ int main(int argc, char** argv)
             return -1;
         }
     }
-
-    path_t pattern = get_file_name_without_extension(pattern_format);
-    path_t format = get_file_extension(pattern_format);
-
-    if (format.empty())
-    {
-        pattern = PATHSTR("%08d");
-        format = pattern_format;
-    }
-
-    if (pattern.empty())
-    {
-        pattern = PATHSTR("%08d");
-    }
-
-    if (!path_is_directory(outputpath))
-    {
-        // guess format from outputpath no matter what format argument specified
-        path_t ext = get_file_extension(outputpath);
-
-        if (ext == PATHSTR("png") || ext == PATHSTR("PNG"))
-        {
-            format = PATHSTR("png");
-        }
-        else if (ext == PATHSTR("webp") || ext == PATHSTR("WEBP"))
-        {
-            format = PATHSTR("webp");
-        }
-        else if (ext == PATHSTR("jpg") || ext == PATHSTR("JPG") || ext == PATHSTR("jpeg") || ext == PATHSTR("JPEG"))
-        {
-            format = PATHSTR("jpg");
-        }
-        else
-        {
-            fprintf(stderr, "invalid outputpath extension type\n");
-            return -1;
-        }
-    }
-
-    if (format != PATHSTR("png") && format != PATHSTR("webp") && format != PATHSTR("jpg"))
-    {
-        fprintf(stderr, "invalid format argument\n");
-        return -1;
-    }
-
+    
     bool rife_v2 = false;
     bool rife_v4 = false;
     if (model.find(PATHSTR("rife-v2")) != path_t::npos)
@@ -687,83 +716,7 @@ int main(int argc, char** argv)
         fprintf(stderr, "only rife-v4 model support custom numframe and timestep\n");
         return -1;
     }
-
-    // collect input and output filepath
-    std::vector<path_t> input0_files;
-    std::vector<path_t> input1_files;
-    std::vector<path_t> output_files;
-    std::vector<float> timesteps;
-    {
-        if (!inputpath.empty() && path_is_directory(inputpath) && path_is_directory(outputpath))
-        {
-            std::vector<path_t> filenames;
-            int lr = list_directory(inputpath, filenames);
-            if (lr != 0)
-                return -1;
-
-            const int count = filenames.size();
-            if (numframe == 0)
-                numframe = count * 2;
-
-            input0_files.resize(numframe);
-            input1_files.resize(numframe);
-            output_files.resize(numframe);
-            timesteps.resize(numframe);
-
-            double scale = (double)count / numframe;
-            for (int i=0; i<numframe; i++)
-            {
-                // TODO provide option to control timestep interpolate method
-//                 float fx = (float)((i + 0.5) * scale - 0.5);
-                float fx = i * scale;
-                int sx = static_cast<int>(floor(fx));
-                fx -= sx;
-
-                if (sx < 0)
-                {
-                    sx = 0;
-                    fx = 0.f;
-                }
-                if (sx >= count - 1)
-                {
-                    sx = count - 2;
-                    fx = 1.f;
-                }
-
-//                 fprintf(stderr, "%d %f %d\n", i, fx, sx);
-
-                path_t filename0 = filenames[sx];
-                path_t filename1 = filenames[sx + 1];
-
-#if _WIN32
-                wchar_t tmp[256];
-                swprintf(tmp, pattern.c_str(), i+1);
-#else
-                char tmp[256];
-                sprintf(tmp, pattern.c_str(), i+1); // ffmpeg start from 1
-#endif
-                path_t output_filename = path_t(tmp) + PATHSTR('.') + format;
-
-                input0_files[i] = inputpath + PATHSTR('/') + filename0;
-                input1_files[i] = inputpath + PATHSTR('/') + filename1;
-                output_files[i] = outputpath + PATHSTR('/') + output_filename;
-                timesteps[i] = fx;
-            }
-        }
-        else if (inputpath.empty() && !path_is_directory(input0path) && !path_is_directory(input1path) && !path_is_directory(outputpath))
-        {
-            input0_files.push_back(input0path);
-            input1_files.push_back(input1path);
-            output_files.push_back(outputpath);
-            timesteps.push_back(timestep);
-        }
-        else
-        {
-            fprintf(stderr, "input0path, input1path and outputpath must be file at the same time\n");
-            fprintf(stderr, "inputpath and outputpath must be directory at the same time\n");
-            return -1;
-        }
-    }
+    
 
     path_t modeldir = sanitize_dirpath(model);
 
@@ -787,7 +740,6 @@ int main(int argc, char** argv)
 
     int cpu_count = std::max(1, ncnn::get_cpu_count());
     jobs_load = std::min(jobs_load, cpu_count);
-    jobs_save = std::min(jobs_save, cpu_count);
 
     int gpu_count = ncnn::get_gpu_count();
     for (int i=0; i<use_gpu_count; i++)
@@ -832,10 +784,12 @@ int main(int argc, char** argv)
             // load image
             LoadThreadParams ltp;
             ltp.jobs_load = jobs_load;
-            ltp.input0_files = input0_files;
-            ltp.input1_files = input1_files;
-            ltp.output_files = output_files;
-            ltp.timesteps = timesteps;
+            ltp.step = std::min(std::max((1.0/timestep)-1.0, 1.0), 3.0);
+#if _WIN32
+            VideoDecoder = new FFmpegVideoDecoder(wstr2str(inputpath));
+#else
+            VideoDecoder = new FFmpegVideoDecoder(inputpath);
+#endif
 
             ncnn::Thread load_thread(load, (void*)&ltp);
 
@@ -868,7 +822,15 @@ int main(int argc, char** argv)
             // save image
             SaveThreadParams stp;
             stp.verbose = verbose;
+            stp.width = VideoDecoder->GetWidth();
+            stp.height = VideoDecoder->GetHeight();
+#if _WIN32
+            stp.save_path = wstr2str(outputpath);
+#else
+            stp.save_path = outputpath;
+#endif
 
+            jobs_save = 1;
             std::vector<ncnn::Thread*> save_threads(jobs_save);
             for (int i=0; i<jobs_save; i++)
             {
@@ -878,8 +840,8 @@ int main(int argc, char** argv)
             // end
             load_thread.join();
 
-            Task end;
-            end.id = -233;
+            auto end = std::make_shared<Task>();
+            end->id = -233;
 
             for (int i=0; i<total_jobs_proc; i++)
             {
@@ -912,6 +874,10 @@ int main(int argc, char** argv)
     }
 
     ncnn::destroy_gpu_instance();
+    auto end_time = std::chrono::system_clock::now();
+    auto diff = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - begin_time);
+
+    fprintf(stderr, "Convert Total Cost: %lld\n", diff.count());
 
     return 0;
 }

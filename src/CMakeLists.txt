@@ -262,6 +262,7 @@ add_executable(rife-ncnn-vulkan
     main.cpp
     rife.cpp
     warp.cpp
+    FFmpegCommon.cpp FFmpegMuxing.cpp FFmpegVideoDecoder.cpp FFmpegVideoEncoder.cpp
 )
 
 add_dependencies(rife-ncnn-vulkan generate-spirv)
@@ -291,3 +292,43 @@ if(USE_STATIC_MOLTENVK)
 endif()
 
 target_link_libraries(rife-ncnn-vulkan ${RIFE_LINK_LIBRARIES})
+
+# FFmpeg
+if (CMAKE_SIZEOF_VOID_P MATCHES 8)
+	set( PROJECT_ARCH "x86_64" )
+else(CMAKE_SIZEOF_VOID_P MATCHES 8)
+	set( PROJECT_ARCH "x86" )
+endif(CMAKE_SIZEOF_VOID_P MATCHES 8)
+
+
+set(FFmpeg_ROOT ffmpeg)
+
+target_link_directories(rife-ncnn-vulkan PUBLIC ${FFmpeg_ROOT}/lib)
+
+file(GLOB FFmpeg_Dlls RELATIVE ${FFmpeg_ROOT}/bin *.dll)
+
+foreach (Dll ${FFmpeg_Dlls})
+    add_custom_command(TARGET rife-ncnn-vulkan POST_BUILD  
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different 
+            "${FFmpeg_ROOT}/bin/${Dll}"    
+            $<TARGET_FILE_DIR:rife-ncnn-vulkan>)
+
+endforeach()
+
+
+foreach (lib "avformat" "avcodec" "avutil" "swscale" "swresample")
+
+	target_link_libraries(${PROJECT_NAME} ${lib})
+
+	# Header file
+	find_path(${lib}_INCLUDE "lib${lib}/${lib}.h" PATHS ${FFmpeg_ROOT}/include)
+	if (NOT ${lib}_INCLUDE)
+		message(FATAL_ERROR "Could not find header file of library \"${lib}\"")
+	endif()
+	target_include_directories(${PROJECT_NAME} PRIVATE ${${lib}_INCLUDE})
+endforeach()
+
+
+target_link_libraries(rife-ncnn-vulkan ${REALESRGAN_LINK_LIBRARIES} -static-libstdc++)
+
+

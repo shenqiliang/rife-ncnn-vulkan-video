@@ -82,8 +82,8 @@ static void load_param_model(ncnn::Net& net, const std::wstring& modeldir, const
 {
     wchar_t parampath[256];
     wchar_t modelpath[256];
-    swprintf(parampath, 256, L"%s/%s.param", modeldir.c_str(), name);
-    swprintf(modelpath, 256, L"%s/%s.bin", modeldir.c_str(), name);
+    swprintf(parampath, 256, L"%s\\%s.param", modeldir.c_str(), name);
+    swprintf(modelpath, 256, L"%s\\%s.bin", modeldir.c_str(), name);
 
     {
         FILE* fp = _wfopen(parampath, L"rb");
